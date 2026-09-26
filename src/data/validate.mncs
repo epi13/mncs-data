@@ -1,0 +1,101 @@
+mncs 0.18;
+
+// mncs.data.validate.v1 — typed schema validation with structured failures.
+//
+// The core is generic over the column width: `validate_row` works over
+// any `[ColumnSpec; C]` against a matching `[Cell; C]`. The canonical
+// 4-column tables call it with `C = 4`; wider or narrower shapes reuse
+// the same semantics without duplicated code.
+//
+// Failure kinds (numeric codes for hosts and tests):
+//   1 MissingRequired — required column holds Missing
+//   2 TypeMismatch    — cell kind differs from the column kind
+//                      (`detail` carries the expected kind code)
+//   3 InvalidCell     — cell is Invalid (`detail` carries the cell code)
+//
+// Optional columns holding Missing pass silently. At most 8 failures
+// are recorded; further failures still fail the row but leave the
+// window full (bounded diagnostics, documented).
+
+module mncs.data.validate.v1;
+
+use mncs.data.cell.v1 as cell;
+use mncs.data.schema.v1 as schema;
+
+enum FailKind { MissingRequired, TypeMismatch, InvalidCell }
+
+record FieldFailure {
+    col: u64,
+    kind: FailKind,
+    detail: u64
+}
+
+record Validation {
+    ok: bool,
+    failures: [FieldFailure; 8],
+    count: u64
+}
+
+record ValidateState {
+    ok: bool,
+    failures: [FieldFailure; 8],
+    count: u64
+}
+
+fn fail_code(kind: FailKind) -> (result: u64) {
+    return match kind {
+        FailKind.MissingRequired => 1,
+        FailKind.TypeMismatch => 2,
+        FailKind.InvalidCell => 3,
+    };
+}
+
+fn blank_failure() -> (result: FieldFailure) {
+    return FieldFailure { col: 8, kind: FailKind.MissingRequired, detail: 0 };
+}
+
+fn record_failure(state: ValidateState, col: u64, kind: FailKind, detail: u64) -> (result: ValidateState) {
+    if state.count < 8 {
+        let slot: u64 = select(state.count < 8, state.count, 0);
+        return ValidateState {
+            ok: false,
+            failures: replace(state.failures, slot, FieldFailure { col: col, kind: kind, detail: detail }),
+            count: state.count +% 1
+        };
+    }
+    return ValidateState { ..state, ok: false };
+}
+
+fn check_column(state: ValidateState, entry: ColumnSpec, current: Cell, col: u64) -> (result: ValidateState) {
+    if cell.is_missing(current) {
+        if entry.required {
+            return record_failure(state, col, FailKind.MissingRequired, 0);
+        }
+        return state;
+    }
+    if cell.is_invalid(current) {
+        return record_failure(state, col, FailKind.InvalidCell, cell.invalid_code(current));
+    }
+    if cell.is_kind(current, entry.kind) == false {
+        return record_failure(state, col, FailKind.TypeMismatch, cell.kind_code(entry.kind));
+    }
+    return state;
+}
+
+fn validate_row<C: Nat>(cols: [ColumnSpec; C], row: [Cell; C]) -> (result: Validation) {
+    let z: FieldFailure = blank_failure();
+    let seed: ValidateState = ValidateState {
+        ok: true,
+        failures: [z, z, z, z, z, z, z, z],
+        count: 0
+    };
+    iterate i over cols carrying state: ValidateState = seed {
+        next state = check_column(state, cols[i], row[i], i);
+    }
+    return Validation { ok: state.ok, failures: state.failures, count: state.count };
+}
+
+// Convenience entry for the canonical 4-column window.
+fn validate_row4(schema_value: Schema4, row: [Cell; 4]) -> (result: Validation) {
+    return validate_row(schema_value.cols, row);
+}

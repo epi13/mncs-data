@@ -1,0 +1,85 @@
+mncs 0.18;
+
+// mncs.data.image.v1 — deterministic digests and transformation notes.
+//
+// This module is the Store/Lineage boundary, not a second Store or a
+// provenance graph. Tables are already self-contained values (fixed
+// arrays of scalars: no references, no handles), so they persist by
+// value; what Store and Lineage need from Data is:
+//
+//   - a deterministic digest per schema, row, and table (content
+//     identity for caching, evidence, and committed generations);
+//   - a transformation note per operation (input digest, op code,
+//     output digest) that Lineage can file into derivation graphs
+//     without Data owning any graph semantics.
+//
+// Digests fold FNV-1a over exact byte spellings: schema names and
+// kinds, cell tags plus payload bytes, integers as unsigned-64
+// little-endian via `mncs.std.encoding`. Equal semantic values digest
+// equally; column order, row order, and every cell bit matter. Digests
+// are deterministic, not cryptographic.
+//
+// Op codes: 1 filter, 2 sort, 3 project, 4 csv-parse, 5 csv-emit,
+// 6 validate-table (a check, listed for completeness in notes).
+
+module mncs.data.image.v1;
+
+use mncs.data.cell.v1 as cell;
+use mncs.data.schema.v1 as schema;
+use mncs.data.table.v1 as table;
+use mncs.std.fnv1a.v1 as fnv;
+use mncs.std.encoding.v1 as enc;
+
+record TransformNote {
+    op: u64,
+    input_digest: u64,
+    output_digest: u64
+}
+
+fn bytes_digest256(bytes: [byte; up_to 256], len: u64) -> (result: u64) {
+    return fnv.fold<256>(fnv.offset_basis(), bytes, len);
+}
+
+fn fold_cell(state: u64, current: Cell) -> (result: u64) {
+    return match current {
+        Cell.Int { value } => fnv.fold<8>(fnv.step(state, 1), enc.encode_u64(value as u64), 8),
+        Cell.Text { bytes, len } => fnv.fold<32>(fnv.step(state, 2), bytes, len),
+        Cell.Bool { value } => fnv.step(fnv.step(state, 3), select(value, 1, 0)),
+        Cell.Missing => fnv.step(state, 4),
+        Cell.Invalid { code } => fnv.fold<8>(fnv.step(state, 5), enc.encode_u64(code), 8),
+    };
+}
+
+fn fold_column(state: u64, entry: ColumnSpec) -> (result: u64) {
+    let named: u64 = fnv.fold<32>(state, entry.name, entry.name_len);
+    return fnv.step(named, cell.kind_code(entry.kind) as byte);
+}
+
+fn schema_digest(schema_value: Schema4) -> (result: u64) {
+    let cols: [ColumnSpec; 4] = schema_value.cols;
+    let s0: u64 = fold_column(fnv.offset_basis(), cols[0]);
+    let s1: u64 = fold_column(s0, cols[1]);
+    let s2: u64 = fold_column(s1, cols[2]);
+    return fold_column(s2, cols[3]);
+}
+
+fn row_digest(row: [Cell; 4]) -> (result: u64) {
+    let s0: u64 = fold_cell(fnv.offset_basis(), row[0]);
+    let s1: u64 = fold_cell(s0, row[1]);
+    let s2: u64 = fold_cell(s1, row[2]);
+    return fold_cell(s2, row[3]);
+}
+
+fn table_digest(source: Table) -> (result: u64) {
+    let rows: [[Cell; 4]; 16] = source.rows;
+    let seed: u64 = fnv.fold<8>(fnv.offset_basis(), enc.encode_u64(schema_digest(source.schema)), 8);
+    iterate i over rows carrying state: u64 = seed {
+        let live: bool = i < source.row_count;
+        next state = select(live, fnv.fold<8>(state, enc.encode_u64(row_digest(rows[i])), 8), state);
+    }
+    return state;
+}
+
+fn note(op: u64, input_digest: u64, output_digest: u64) -> (result: TransformNote) {
+    return TransformNote { op: op, input_digest: input_digest, output_digest: output_digest };
+}

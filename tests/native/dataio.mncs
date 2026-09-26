@@ -1,0 +1,241 @@
+mncs 0.18;
+
+// Native contracts for CSV interchange, round-trips, malformed input,
+// digests, and deterministic generation. Expectations are in-language
+// assertions; byte-exact emission is pinned against numeric literals.
+
+module mncs.data.test.dataio.v1;
+
+use mncs.test.assertions;
+use mncs.test.suite;
+use mncs.test.generative;
+use mncs.data.cell.v1 as cell;
+use mncs.data.schema.v1 as schema;
+use mncs.data.validate.v1 as validate;
+use mncs.data.table.v1 as table;
+use mncs.data.ops.v1 as ops;
+use mncs.data.csv.v1 as csv;
+use mncs.data.image.v1 as image;
+
+fn c8(a: byte, b: byte, c: byte, d: byte, e: byte, f: byte, g: byte, h: byte) -> (result: [byte; 8]) {
+    return [a, b, c, d, e, f, g, h];
+}
+
+fn t32(a: byte, b: byte, c: byte, len: u64) -> (result: [byte; 32]) {
+    return [a, b, c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+}
+
+fn test_schema() -> (result: Schema4) {
+    let id_col: ColumnSpec = schema.make_column(c8(105, 100, 0, 0, 0, 0, 0, 0), 2, CellKind.Int, true);
+    let name_col: ColumnSpec = schema.make_column(c8(110, 97, 109, 101, 0, 0, 0, 0), 4, CellKind.Text, false);
+    let age_col: ColumnSpec = schema.make_column(c8(97, 103, 101, 0, 0, 0, 0, 0), 3, CellKind.Int, false);
+    let ok_col: ColumnSpec = schema.make_column(c8(111, 107, 0, 0, 0, 0, 0, 0), 2, CellKind.Bool, true);
+    return schema.make_schema(id_col, name_col, age_col, ok_col);
+}
+
+// Byte-exact line comparison against a 64-window expectation.
+fn line_eq(buf: LineBuf, expected: [byte; 64], len: u64) -> (result: bool) {
+    if buf.ok == false || buf.len != len || len > 64 {
+        return false;
+    }
+    let blank: [byte; 64] = [0; 64];
+    let head: [byte; 64] = copy_span(blank, 0, buf.bytes, 0, len);
+    iterate i over head carrying same: bool = true {
+        let live: bool = i < len;
+        next same = same && select(live, head[i] == expected[i], true);
+    }
+    return same;
+}
+
+// --- emission ---
+
+test emit_int_row_exact() -> (result: TestResult) {
+    let row: [Cell; 4] = [cell.int_cell(1), cell.int_cell(-2), cell.int_cell(300), cell.int_cell(0)];
+    let buf: LineBuf = csv.emit_row(row);
+    let expected: [byte; 64] = [49, 44, 45, 50, 44, 51, 48, 48, 44, 48, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    return from_assertion(equals_bool(true, line_eq(buf, expected, 10), 6101));
+}
+
+test emit_mixed_row_exact() -> (result: TestResult) {
+    let row: [Cell; 4] = [cell.text_cell(t32(104, 105, 0, 2), 2), cell.bool_cell(true), cell.missing_cell(), cell.invalid_cell(2)];
+    let buf: LineBuf = csv.emit_row(row);
+    let expected: [byte; 64] = [104, 105, 44, 116, 114, 117, 101, 44, 44, 33, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    return from_assertion(equals_bool(true, line_eq(buf, expected, 11), 6102));
+}
+
+test emit_int_edges() -> (result: TestResult) {
+    let lo: LineBuf = csv.emit_row([cell.int_cell(-9223372036854775808), cell.missing_cell(), cell.missing_cell(), cell.missing_cell()]);
+    let hi: LineBuf = csv.emit_row([cell.int_cell(9223372036854775807), cell.missing_cell(), cell.missing_cell(), cell.missing_cell()]);
+    let want_lo: [byte; 64] = [45, 57, 50, 50, 51, 51, 55, 50, 48, 51, 54, 56, 53, 52, 55, 55, 53, 56, 48, 56, 44, 44, 44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let want_hi: [byte; 64] = [57, 50, 50, 51, 51, 55, 50, 48, 51, 54, 56, 53, 52, 55, 55, 53, 56, 48, 55, 44, 44, 44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let ok: bool = line_eq(lo, want_lo, 23) && line_eq(hi, want_hi, 22);
+    return from_assertion(equals_bool(true, ok, 6103));
+}
+
+test emit_header_exact() -> (result: TestResult) {
+    let buf: LineBuf = csv.emit_header(test_schema());
+    let expected: [byte; 64] = [105, 100, 44, 110, 97, 109, 101, 44, 97, 103, 101, 44, 111, 107, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    return from_assertion(equals_bool(true, line_eq(buf, expected, 14), 6104));
+}
+
+// --- parsing ---
+
+test parse_clean_line() -> (result: TestResult) {
+    let raw: [byte; up_to 256] = [55, 44, 97, 110, 110, 44, 51, 51, 44, 116, 114, 117, 101];
+    let parsed: ParseRow = csv.parse_typed(test_schema(), raw, 13, false);
+    let v0: IntView = cell.as_int(parsed.cells[0]);
+    let v2: IntView = cell.as_int(parsed.cells[2]);
+    let b3: BoolView = cell.as_bool(parsed.cells[3]);
+    let want_text: Cell = cell.text_cell(t32(97, 110, 110, 3), 3);
+    let ok: bool = csv.line_code(parsed.status) == 0 && parsed.n == 4 && v0.value == 7 && cell.cell_eq(parsed.cells[1], want_text) && v2.value == 33 && b3.value;
+    return from_assertion(equals_bool(true, ok, 6105));
+}
+
+test parse_sparse_missing() -> (result: TestResult) {
+    let raw: [byte; up_to 256] = [55, 44, 44, 44, 102, 97, 108, 115, 101];
+    let parsed: ParseRow = csv.parse_typed(test_schema(), raw, 9, false);
+    let v0: IntView = cell.as_int(parsed.cells[0]);
+    let c1missing: bool = cell.is_missing(parsed.cells[1]);
+    let c2missing: bool = cell.is_missing(parsed.cells[2]);
+    let b3: BoolView = cell.as_bool(parsed.cells[3]);
+    let ok: bool = csv.line_code(parsed.status) == 0 && v0.value == 7 && c1missing && c2missing && b3.found && b3.value == false;
+    return from_assertion(equals_bool(true, ok, 6106));
+}
+
+test parse_bad_int_kept() -> (result: TestResult) {
+    let raw: [byte; up_to 256] = [120, 44, 97, 110, 110, 44, 51, 44, 116, 114, 117, 101];
+    let parsed: ParseRow = csv.parse_typed(test_schema(), raw, 12, false);
+    let bad: bool = cell.invalid_code(parsed.cells[0]) == 1;
+    let rest: IntView = cell.as_int(parsed.cells[2]);
+    let ok: bool = csv.line_code(parsed.status) == 0 && parsed.n == 4 && bad && rest.value == 3;
+    return from_assertion(equals_bool(true, ok, 6107));
+}
+
+test parse_bad_bool_kept() -> (result: TestResult) {
+    let raw: [byte; up_to 256] = [55, 44, 97, 110, 110, 44, 51, 44, 109, 97, 121, 98, 101];
+    let parsed: ParseRow = csv.parse_typed(test_schema(), raw, 13, false);
+    return from_assertion(equals_bool(true, cell.invalid_code(parsed.cells[3]) == 2, 6108));
+}
+
+test parse_long_text_invalid() -> (result: TestResult) {
+    let raw: [byte; up_to 256] = [55, 44, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 44, 51, 44, 116, 114, 117, 101];
+    let parsed: ParseRow = csv.parse_typed(test_schema(), raw, 42, false);
+    return from_assertion(equals_bool(true, cell.invalid_code(parsed.cells[1]) == 3, 6109));
+}
+
+test parse_ragged_long() -> (result: TestResult) {
+    let raw: [byte; up_to 256] = [49, 44, 50, 44, 51, 44, 52, 44, 53];
+    let parsed: ParseRow = csv.parse_typed(test_schema(), raw, 9, false);
+    let v0: IntView = cell.as_int(parsed.cells[0]);
+    let ok: bool = csv.line_code(parsed.status) == 1 && parsed.n == 4 && v0.value == 1;
+    return from_assertion(equals_bool(true, ok, 6110));
+}
+
+test parse_short_pads_missing() -> (result: TestResult) {
+    let raw: [byte; up_to 256] = [55, 44, 97, 110, 110];
+    let parsed: ParseRow = csv.parse_typed(test_schema(), raw, 5, false);
+    let ok: bool = csv.line_code(parsed.status) == 0 && parsed.n == 2 && cell.is_missing(parsed.cells[2]) && cell.is_missing(parsed.cells[3]);
+    return from_assertion(equals_bool(true, ok, 6111));
+}
+
+test parse_empty_line() -> (result: TestResult) {
+    let raw: [byte; up_to 256] = [];
+    let parsed: ParseRow = csv.parse_typed(test_schema(), raw, 0, false);
+    return from_assertion(equals_bool(true, csv.line_code(parsed.status) == 3 && parsed.n == 0, 6112));
+}
+
+test parse_strips_cr() -> (result: TestResult) {
+    let raw: [byte; up_to 256] = [55, 44, 97, 110, 110, 44, 51, 44, 116, 114, 117, 101, 13];
+    let parsed: ParseRow = csv.parse_typed(test_schema(), raw, 13, false);
+    let b3: BoolView = cell.as_bool(parsed.cells[3]);
+    return from_assertion(equals_bool(true, csv.line_code(parsed.status) == 0 && b3.found && b3.value, 6113));
+}
+
+test parse_int_edges() -> (result: TestResult) {
+    let big: [byte; up_to 256] = [55, 44, 97, 110, 110, 44, 57, 57, 57, 57, 57, 57, 57, 57, 57, 57, 57, 57, 57, 57, 57, 57, 57, 57, 57, 57, 44, 116, 114, 117, 101];
+    let neg: [byte; up_to 256] = [45, 52, 50, 44, 97, 110, 110, 44, 45, 55, 44, 102, 97, 108, 115, 101];
+    let plus: [byte; up_to 256] = [43, 55, 44, 97, 110, 110, 44, 51, 44, 116, 114, 117, 101];
+    let space: [byte; up_to 256] = [32, 55, 44, 97, 110, 110, 44, 51, 44, 116, 114, 117, 101];
+    let wide: ParseRow = csv.parse_typed(test_schema(), big, 31, false);
+    let neged: ParseRow = csv.parse_typed(test_schema(), neg, 16, false);
+    let plused: ParseRow = csv.parse_typed(test_schema(), plus, 13, false);
+    let spaced: ParseRow = csv.parse_typed(test_schema(), space, 13, false);
+    let vneg0: IntView = cell.as_int(neged.cells[0]);
+    let vneg2: IntView = cell.as_int(neged.cells[2]);
+    let ok: bool = cell.invalid_code(wide.cells[2]) == 1 && vneg0.value == -42 && vneg2.value == -7;
+    let strict: bool = cell.invalid_code(plused.cells[0]) == 1 && cell.invalid_code(spaced.cells[0]) == 1;
+    return from_assertion(equals_bool(true, ok && strict, 6114));
+}
+
+// --- round trips and properties ---
+
+test roundtrip_generated_rows() -> (result: TestResult) {
+    let ticks: [u64; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+    iterate k over ticks carrying good: bool = true {
+        next good = good && roundtrip_case(k);
+    }
+    return from_assertion(equals_bool(true, good, 6115));
+}
+
+fn roundtrip_case(k: u64) -> (result: bool) {
+    let a: i64 = (replay(12345, k, 2000) as i64) - 1000;
+    let b: i64 = (replay(777, k, 200) as i64) - 100;
+    let flag: bool = replay(999, k, 2) == 1;
+    let gap: bool = k % 3 == 0;
+    let m: Cell = cell.missing_cell();
+    let row: [Cell; 4] = [cell.int_cell(a), cell.text_cell(t32(107, 0, 0, 1), 1), cell.int_cell(b), select(gap, m, cell.bool_cell(flag))];
+    let buf: LineBuf = csv.emit_row(row);
+    let back: ParseRow = csv.parse_typed(test_schema(), buf.bytes, buf.len, false);
+    let same0: bool = cell.cell_eq(back.cells[0], row[0]);
+    let same1: bool = cell.cell_eq(back.cells[1], row[1]);
+    let same2: bool = cell.cell_eq(back.cells[2], row[2]);
+    let same3: bool = cell.cell_eq(back.cells[3], row[3]);
+    return buf.ok && csv.line_code(back.status) == 0 && same0 && same1 && same2 && same3;
+}
+
+test roundtrip_space_text() -> (result: TestResult) {
+    let row: [Cell; 4] = [cell.int_cell(1), cell.text_cell(t32(97, 32, 98, 3), 3), cell.int_cell(2), cell.bool_cell(true)];
+    let buf: LineBuf = csv.emit_row(row);
+    let back: ParseRow = csv.parse_typed(test_schema(), buf.bytes, buf.len, false);
+    return from_assertion(equals_bool(true, cell.cell_eq(back.cells[1], row[1]), 6116));
+}
+
+test comma_text_never_silent() -> (result: TestResult) {
+    let row: [Cell; 4] = [cell.int_cell(1), cell.text_cell(t32(97, 44, 98, 3), 3), cell.int_cell(2), cell.bool_cell(true)];
+    let buf: LineBuf = csv.emit_row(row);
+    let back: ParseRow = csv.parse_typed(test_schema(), buf.bytes, buf.len, false);
+    return from_assertion(equals_bool(true, csv.line_code(back.status) == 1, 6117));
+}
+
+test line_digest_stable() -> (result: TestResult) {
+    let a: [byte; up_to 256] = [55, 44, 97, 110, 110];
+    let b: [byte; up_to 256] = [55, 44, 97, 110, 111];
+    let d0: u64 = image.bytes_digest256(a, 5);
+    let d1: u64 = image.bytes_digest256(a, 5);
+    let d2: u64 = image.bytes_digest256(b, 5);
+    return from_assertion(equals_bool(true, d0 == d1 && d0 == d2 == false, 6118));
+}
+
+test table_from_lines() -> (result: TestResult) {
+    let l0: [byte; up_to 256] = [55, 44, 97, 110, 110, 44, 51, 51, 44, 116, 114, 117, 101];
+    let l1: [byte; up_to 256] = [56, 44, 98, 111, 98, 44, 52, 44, 102, 97, 108, 115, 101];
+    let p0: ParseRow = csv.parse_typed(test_schema(), l0, 13, false);
+    let p1: ParseRow = csv.parse_typed(test_schema(), l1, 13, false);
+    let t0: Table = table.empty_table(test_schema());
+    let t1: Table = table.push_row(t0, p0.cells).table;
+    let t2: Table = table.push_row(t1, p1.cells).table;
+    let report: TableReport = table.validate_table(t2);
+    return from_assertion(equals_bool(true, t2.row_count == 2 && report.ok, 6119));
+}
+
+test sorted_emit_order_free() -> (result: TestResult) {
+    let t0: Table = table.empty_table(test_schema());
+    let t1: Table = table.push_row(t0, [cell.int_cell(2), cell.missing_cell(), cell.missing_cell(), cell.bool_cell(true)]).table;
+    let t2: Table = table.push_row(t1, [cell.int_cell(1), cell.missing_cell(), cell.missing_cell(), cell.bool_cell(false)]).table;
+    let u0: Table = table.empty_table(test_schema());
+    let u1: Table = table.push_row(u0, [cell.int_cell(1), cell.missing_cell(), cell.missing_cell(), cell.bool_cell(false)]).table;
+    let u2: Table = table.push_row(u1, [cell.int_cell(2), cell.missing_cell(), cell.missing_cell(), cell.bool_cell(true)]).table;
+    let ordered_t: Table = ops.sort_table(t2, 0, true);
+    let ordered_u: Table = ops.sort_table(u2, 0, true);
+    return from_assertion(equals_bool(true, image.table_digest(ordered_t) == image.table_digest(ordered_u), 6120));
+}

@@ -1,0 +1,291 @@
+mncs 0.18;
+
+// mncs.data.ops.v1 — small composable table transformations.
+//
+// The language has no lambdas, so predicates are explicit descriptor
+// data, not closures: `IntPred` enumerates the six integer comparisons
+// and `RowPred` pins one to a column. This bounds what filters can say
+// (recorded as pressure P-DATA-001) while keeping every filter total,
+// inspectable, and testable. Mapping over rows stays in the caller:
+// Data owns relational primitives, not arbitrary row functions.
+//
+// Missing and Invalid cells never satisfy a predicate — filtering on a
+// column with gaps keeps only present well-typed matches, explicitly.
+// Sorting places non-Int keys last, stably, instead of inventing an
+// order for absent or malformed values. Aggregates skip Missing openly
+// and report Invalid separately instead of folding either silently.
+
+module mncs.data.ops.v1;
+
+use mncs.data.cell.v1 as cell;
+use mncs.data.schema.v1 as schema;
+use mncs.data.table.v1 as table;
+
+enum IntPred { Eq, Ne, Gt, Lt, Ge, Le }
+
+record RowPred {
+    col: u64,
+    pred: IntPred,
+    arg: i64
+}
+
+record IntAgg {
+    total: i64,
+    valid: u64,
+    skipped_missing: u64,
+    invalid_seen: u64
+}
+
+record IntExtent {
+    found: bool,
+    value: i64
+}
+
+// Numeric predicate projection (no enum equality): Eq 0, Ne 1,
+// Gt 2, Lt 3, Ge 4, Le 5.
+fn pred_code(pred: IntPred) -> (result: u64) {
+    return match pred {
+        IntPred.Eq => 0,
+        IntPred.Ne => 1,
+        IntPred.Gt => 2,
+        IntPred.Lt => 3,
+        IntPred.Ge => 4,
+        IntPred.Le => 5,
+    };
+}
+
+fn pred_holds(pred: IntPred, value: i64, arg: i64) -> (result: bool) {
+    return match pred {
+        IntPred.Eq => value == arg,
+        IntPred.Ne => value == arg == false,
+        IntPred.Gt => value > arg,
+        IntPred.Lt => value < arg,
+        IntPred.Ge => value > arg || value == arg,
+        IntPred.Le => value < arg || value == arg,
+    };
+}
+
+// Whether one row satisfies the predicate. Only present Int cells in
+// the pinned column can match; everything else is false, openly.
+fn row_matches(row: [Cell; 4], pred: RowPred) -> (result: bool) {
+    let slot: u64 = select(pred.col < 4, pred.col, 0);
+    let current: Cell = row[slot];
+    return match current {
+        Cell.Int { value } => select(pred.col < 4, pred_holds(pred.pred, value, pred.arg), false),
+        Cell.Text { bytes, len } => false,
+        Cell.Bool { value } => false,
+        Cell.Missing => false,
+        Cell.Invalid { code } => false,
+    };
+}
+
+// Keep the rows that match, in order. The schema travels unchanged.
+fn filter_table(source: Table, pred: RowPred) -> (result: Table) {
+    let rows: [[Cell; 4]; 16] = source.rows;
+    iterate i over rows carrying out: Table = table.empty_table(source.schema) {
+        let live: bool = i < source.row_count;
+        let keep: bool = live && row_matches(rows[i], pred);
+        let grown: PushOut = table.push_row(out, rows[i]);
+        next out = select(keep, grown.table, out);
+    }
+    return out;
+}
+
+// Selection order over row indices by the pinned Int column key.
+// Non-Int keys compare unordered (rank 2, never less), so they sink
+// last, stably: absent and malformed values never invent an order,
+// and equal keys keep their input order. Returns the permutation.
+fn sort_order(source: Table, col: u64, ascending: bool) -> (result: [u64; 16]) {
+    let rows: [[Cell; 4]; 16] = source.rows;
+    let slot: u64 = select(col < 4, col, 0);
+    iterate i over rows carrying order: [u64; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
+        next order = place_extreme(order, rows, slot, source.row_count, i, ascending);
+    }
+    return order;
+}
+
+fn sort_key(rows: [[Cell; 4]; 16], slot: u64, index: u64) -> (result: Cell) {
+    let at: u64 = select(index < 16, index, 0);
+    let row: [Cell; 4] = rows[at];
+    return row[slot];
+}
+
+// One selection step: find the minimum over positions [i, live) and
+// swap it into position i. Rounds past the live window carry through.
+fn place_extreme(order: [u64; 16], rows: [[Cell; 4]; 16], slot: u64, live_count: u64, i: u64, ascending: bool) -> (result: [u64; 16]) {
+    if i < live_count && i < 16 {
+        iterate j over order carrying best: u64 = i {
+            next best = prefer_extreme(order, rows, slot, live_count, i, best, j, ascending);
+        }
+        return swap_positions(order, i, best);
+    }
+    return order;
+}
+
+// Keep the extreme key for the requested direction. Positions, not
+// row indices, travel here: `best` is the winning position so far.
+// An ordered candidate displaces an unordered incumbent (unordered
+// sinks last in both directions); among ordered keys the strictly
+// better one wins and ties keep the incumbent (stability both ways).
+// Unordered candidates never displace anything.
+fn prefer_extreme(order: [u64; 16], rows: [[Cell; 4]; 16], slot: u64, live_count: u64, i: u64, best: u64, j: u64, ascending: bool) -> (result: u64) {
+    let in_window: bool = j >= i && j < live_count && j < 16;
+    if in_window {
+        let here: u64 = select(j < 16, j, 0);
+        let best_at: u64 = select(best < 16, best, 0);
+        let cand: Cell = sort_key(rows, slot, order[here]);
+        let inc: Cell = sort_key(rows, slot, order[best_at]);
+        let cand_ord: bool = cell.is_kind(cand, CellKind.Int);
+        let inc_ord: bool = cell.is_kind(inc, CellKind.Int);
+        let rank: i64 = cell.cmp_int(cand, inc);
+        let better: bool = select(ascending, rank == -1, rank == 1);
+        let wins: bool = cand_ord && (inc_ord == false || better);
+        return select(wins, j, best);
+    }
+    return best;
+}
+
+fn swap_positions(order: [u64; 16], a: u64, b: u64) -> (result: [u64; 16]) {
+    let at_a: u64 = select(a < 16, a, 0);
+    let at_b: u64 = select(b < 16, b, 0);
+    let va: u64 = order[at_a];
+    let vb: u64 = order[at_b];
+    return replace(replace(order, at_a, vb), at_b, va);
+}
+
+// Reorder rows by a precomputed permutation (see `sort_order`).
+fn permute(source: Table, order: [u64; 16]) -> (result: Table) {
+    let rows: [[Cell; 4]; 16] = source.rows;
+    iterate i over rows carrying out: Table = table.empty_table(source.schema) {
+        let live: bool = i < source.row_count;
+        let at: u64 = select(i < 16, i, 0);
+        let grown: PushOut = table.push_row(out, rows[select(order[at] < 16, order[at], 0)]);
+        next out = select(live, grown.table, out);
+    }
+    return out;
+}
+
+// Sort by one Int column. Ties keep input order in both directions;
+// unordered keys sink last in both directions.
+fn sort_table(source: Table, col: u64, ascending: bool) -> (result: Table) {
+    return permute(source, sort_order(source, col, ascending));
+}
+
+// Narrowing projections: keep the columns in `order`. Reordering is
+// the caller's explicit choice; out-of-range positions fill Missing
+// openly (they are visible in the output, never silent). Widths are
+// concrete: a generic blank `[Cell; K]` cannot be constructed, so each
+// supported width has its own total function.
+fn project1(row: [Cell; 4], order: [u64; 1]) -> (result: [Cell; 1]) {
+    let want: u64 = order[0];
+    let slot: u64 = select(want < 4, want, 0);
+    return [select(want < 4, row[slot], cell.missing_cell())];
+}
+
+fn project2(row: [Cell; 4], order: [u64; 2]) -> (result: [Cell; 2]) {
+    let m: Cell = cell.missing_cell();
+    let a: u64 = order[0];
+    let b: u64 = order[1];
+    let sa: u64 = select(a < 4, a, 0);
+    let sb: u64 = select(b < 4, b, 0);
+    return [select(a < 4, row[sa], m), select(b < 4, row[sb], m)];
+}
+
+fn project3(row: [Cell; 4], order: [u64; 3]) -> (result: [Cell; 3]) {
+    let m: Cell = cell.missing_cell();
+    let a: u64 = order[0];
+    let b: u64 = order[1];
+    let c: u64 = order[2];
+    let sa: u64 = select(a < 4, a, 0);
+    let sb: u64 = select(b < 4, b, 0);
+    let sc: u64 = select(c < 4, c, 0);
+    return [select(a < 4, row[sa], m), select(b < 4, row[sb], m), select(c < 4, row[sc], m)];
+}
+
+// Sum one column's Int cells. Missing is skipped openly; Invalid is
+// reported separately and never folded into the total.
+fn sum_int(col: ColumnVec) -> (result: IntAgg) {
+    let cells: [Cell; 16] = col.cells;
+    iterate i over cells carrying agg: IntAgg = IntAgg { total: 0, valid: 0, skipped_missing: 0, invalid_seen: 0 } {
+        let live: bool = i < col.len;
+        let current: Cell = cells[i];
+        next agg = fold_int(agg, current, live);
+    }
+    return agg;
+}
+
+fn fold_int(agg: IntAgg, current: Cell, live: bool) -> (result: IntAgg) {
+    if live == false {
+        return agg;
+    }
+    return match current {
+        Cell.Int { value } => IntAgg { total: agg.total +% value, valid: agg.valid +% 1, skipped_missing: agg.skipped_missing, invalid_seen: agg.invalid_seen },
+        Cell.Text { bytes, len } => IntAgg { total: agg.total, valid: agg.valid, skipped_missing: agg.skipped_missing, invalid_seen: agg.invalid_seen +% 1 },
+        Cell.Bool { value } => IntAgg { total: agg.total, valid: agg.valid, skipped_missing: agg.skipped_missing, invalid_seen: agg.invalid_seen +% 1 },
+        Cell.Missing => IntAgg { total: agg.total, valid: agg.valid, skipped_missing: agg.skipped_missing +% 1, invalid_seen: agg.invalid_seen },
+        Cell.Invalid { code } => IntAgg { total: agg.total, valid: agg.valid, skipped_missing: agg.skipped_missing, invalid_seen: agg.invalid_seen +% 1 },
+    };
+}
+
+// Minimum and maximum over one column's Int cells. No Int cells means
+// `found = false` — never a silent zero.
+fn extent_int(col: ColumnVec, want_min: bool) -> (result: IntExtent) {
+    let cells: [Cell; 16] = col.cells;
+    iterate i over cells carrying best: IntExtent = IntExtent { found: false, value: 0 } {
+        let live: bool = i < col.len;
+        next best = fold_extent(best, cells[i], live, want_min);
+    }
+    return best;
+}
+
+fn fold_extent(best: IntExtent, current: Cell, live: bool, want_min: bool) -> (result: IntExtent) {
+    if live == false {
+        return best;
+    }
+    return match current {
+        Cell.Int { value } => extend_best(best, value, want_min),
+        Cell.Text { bytes, len } => best,
+        Cell.Bool { value } => best,
+        Cell.Missing => best,
+        Cell.Invalid { code } => best,
+    };
+}
+
+fn extend_best(best: IntExtent, value: i64, want_min: bool) -> (result: IntExtent) {
+    if best.found == false {
+        return IntExtent { found: true, value: value };
+    }
+    if want_min {
+        return IntExtent { found: true, value: select(value < best.value, value, best.value) };
+    }
+    return IntExtent { found: true, value: select(value > best.value, value, best.value) };
+}
+
+// Count cells by state over any cell window. Separate from IntAgg:
+// counts never mix into sums, and every state stays visible.
+record CellCounts {
+    valid: u64,
+    missing: u64,
+    invalid: u64
+}
+
+fn count_states<N: Nat>(cells: [Cell; N], len: u64) -> (result: CellCounts) {
+    iterate i over cells carrying counts: CellCounts = CellCounts { valid: 0, missing: 0, invalid: 0 } {
+        let live: bool = i < len;
+        next counts = fold_count(counts, cells[i], live);
+    }
+    return counts;
+}
+
+fn fold_count(counts: CellCounts, current: Cell, live: bool) -> (result: CellCounts) {
+    if live == false {
+        return counts;
+    }
+    if cell.is_missing(current) {
+        return CellCounts { valid: counts.valid, missing: counts.missing +% 1, invalid: counts.invalid };
+    }
+    if cell.is_invalid(current) {
+        return CellCounts { valid: counts.valid, missing: counts.missing, invalid: counts.invalid +% 1 };
+    }
+    return CellCounts { valid: counts.valid +% 1, missing: counts.missing, invalid: counts.invalid };
+}

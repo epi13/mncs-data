@@ -1,0 +1,120 @@
+mncs 0.18;
+
+// mncs.data.table.v1 — the canonical 4-column, 16-row table window.
+//
+// A Table carries its Schema4 beside at most 16 rows of 4 cells. The
+// 16-row bound is the canonical interactive slice: ingestion past the
+// bound reports overflow explicitly (`push_row`) instead of dropping
+// rows silently, and larger datasets chunk into successive tables
+// (bounded-memory streaming is pressure, not a silent behavior).
+//
+// Tables are self-contained values: fixed arrays of scalars, no
+// references, no handles, no heap. That is the Store contract — a
+// Table persists by value and restores by validation (`validate_table`
+// is the load-time gate).
+
+module mncs.data.table.v1;
+
+use mncs.data.cell.v1 as cell;
+use mncs.data.schema.v1 as schema;
+use mncs.data.validate.v1 as validate;
+
+record Table {
+    schema: Schema4,
+    rows: [[Cell; 4]; 16],
+    row_count: u64
+}
+
+record PushOut {
+    table: Table,
+    ok: bool,
+    overflow: bool
+}
+
+record ColumnVec {
+    cells: [Cell; 16],
+    len: u64
+}
+
+record TableReport {
+    ok: bool,
+    bad_rows: u64,
+    first_bad_row: u64,
+    first_col: u64,
+    first_code: u64
+}
+
+fn empty_row() -> (result: [Cell; 4]) {
+    let m: Cell = cell.missing_cell();
+    return [m, m, m, m];
+}
+
+fn empty_table(schema_value: Schema4) -> (result: Table) {
+    let r: [Cell; 4] = empty_row();
+    return Table {
+        schema: schema_value,
+        rows: [r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r],
+        row_count: 0
+    };
+}
+
+// Append one row. A full table reports overflow and keeps its content;
+// the caller chunks, it never loses rows.
+fn push_row(table: Table, row: [Cell; 4]) -> (result: PushOut) {
+    if table.row_count < 16 {
+        let slot: u64 = select(table.row_count < 16, table.row_count, 0);
+        return PushOut {
+            table: Table {
+                ..table,
+                rows: replace(table.rows, slot, row),
+                row_count: table.row_count +% 1
+            },
+            ok: true,
+            overflow: false
+        };
+    }
+    return PushOut { table: table, ok: false, overflow: true };
+}
+
+// Extract one column as a 16-window vector with live length.
+fn column_vector(table: Table, col: u64) -> (result: ColumnVec) {
+    let m: Cell = cell.missing_cell();
+    let seed: ColumnVec = ColumnVec {
+        cells: [m, m, m, m, m, m, m, m, m, m, m, m, m, m, m, m],
+        len: 0
+    };
+    let rows: [[Cell; 4]; 16] = table.rows;
+    let slot: u64 = select(col < 4, col, 0);
+    iterate i over rows carrying out: ColumnVec = seed {
+        let live: bool = i < table.row_count;
+        let row: [Cell; 4] = rows[i];
+        let at: u64 = select(out.len < 16, out.len, 0);
+        next out = ColumnVec {
+            cells: select(live, replace(out.cells, at, row[slot]), out.cells),
+            len: select(live, out.len +% 1, out.len)
+        };
+    }
+    return out;
+}
+
+// Validate every live row. The report names the first bad row and its
+// first failure (row, column, failure code) — enough context for Debug
+// to show schema identity, field path, and expected-versus-actual.
+fn validate_table(table: Table) -> (result: TableReport) {
+    let rows: [[Cell; 4]; 16] = table.rows;
+    iterate i over rows carrying report: TableReport = TableReport { ok: true, bad_rows: 0, first_bad_row: 16, first_col: 4, first_code: 0 } {
+        let live: bool = i < table.row_count;
+        let checked: Validation = validate.validate_row4(table.schema, rows[i]);
+        let bad: bool = live && checked.ok == false;
+        let first: bool = bad && report.bad_rows == 0;
+        let failure: FieldFailure = checked.failures[0];
+        next report = TableReport {
+            ok: report.ok && select(bad, false, true),
+            bad_rows: select(bad, report.bad_rows +% 1, report.bad_rows),
+            first_bad_row: select(first, i, report.first_bad_row),
+            first_col: select(first, failure.col, report.first_col),
+            first_code: select(first, validate.fail_code(failure.kind), report.first_code)
+        };
+    }
+    return report;
+}

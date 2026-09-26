@@ -1,0 +1,359 @@
+mncs 0.18;
+
+// Native contracts for the mncs.data core: cells, schemas, validation,
+// tables, and relational operators. Every expectation is an in-language
+// assertion with a stable numeric code.
+
+module mncs.data.test.datacore.v1;
+
+use mncs.test.assertions;
+use mncs.test.suite;
+use mncs.data.cell.v1 as cell;
+use mncs.data.schema.v1 as schema;
+use mncs.data.validate.v1 as validate;
+use mncs.data.table.v1 as table;
+use mncs.data.ops.v1 as ops;
+use mncs.data.image.v1 as image;
+
+// One 8-byte spelling chunk from explicit bytes (no string literals).
+fn c8(a: byte, b: byte, c: byte, d: byte, e: byte, f: byte, g: byte, h: byte) -> (result: [byte; 8]) {
+    return [a, b, c, d, e, f, g, h];
+}
+
+// One 32-byte text spelling: three live bytes plus length.
+fn t32(a: byte, b: byte, c: byte, len: u64) -> (result: [byte; 32]) {
+    return [a, b, c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+}
+
+// Test schema: id Int required, name Text optional, age Int optional,
+// ok Bool required.
+fn test_schema() -> (result: Schema4) {
+    let id_col: ColumnSpec = schema.make_column(c8(105, 100, 0, 0, 0, 0, 0, 0), 2, CellKind.Int, true);
+    let name_col: ColumnSpec = schema.make_column(c8(110, 97, 109, 101, 0, 0, 0, 0), 4, CellKind.Text, false);
+    let age_col: ColumnSpec = schema.make_column(c8(97, 103, 101, 0, 0, 0, 0, 0), 3, CellKind.Int, false);
+    let ok_col: ColumnSpec = schema.make_column(c8(111, 107, 0, 0, 0, 0, 0, 0), 2, CellKind.Bool, true);
+    return schema.make_schema(id_col, name_col, age_col, ok_col);
+}
+
+// A valid row: [id, name, age, ok].
+fn good_row() -> (result: [Cell; 4]) {
+    return [cell.int_cell(7), cell.text_cell(t32(97, 110, 110, 3), 3), cell.int_cell(33), cell.bool_cell(true)];
+}
+
+fn int_row(a: i64, b: i64, c: i64, d: i64) -> (result: [Cell; 4]) {
+    return [cell.int_cell(a), cell.int_cell(b), cell.int_cell(c), cell.int_cell(d)];
+}
+
+// --- cells ---
+
+test cell_kind_checks() -> (result: TestResult) {
+    let i: bool = cell.is_kind(cell.int_cell(1), CellKind.Int);
+    let t: bool = cell.is_kind(cell.text_cell(t32(97, 0, 0, 1), 1), CellKind.Text);
+    let b: bool = cell.is_kind(cell.bool_cell(false), CellKind.Bool);
+    let cross: bool = cell.is_kind(cell.int_cell(1), CellKind.Text) == false;
+    let missing_none: bool = cell.is_kind(cell.missing_cell(), CellKind.Int) == false;
+    let invalid_none: bool = cell.is_kind(cell.invalid_cell(1), CellKind.Bool) == false;
+    return from_assertion(equals_bool(true, i && t && b && cross && missing_none && invalid_none, 6001));
+}
+
+test missing_invalid_distinct() -> (result: TestResult) {
+    let m: Cell = cell.missing_cell();
+    let v: Cell = cell.invalid_cell(2);
+    let states: bool = cell.is_missing(m) && cell.is_invalid(v) && cell.is_missing(v) == false && cell.is_invalid(m) == false;
+    let codes: bool = cell.invalid_code(v) == 2 && cell.invalid_code(m) == 0 && cell.invalid_code(cell.int_cell(9)) == 0;
+    let neq: bool = cell.cell_eq(m, v) == false;
+    return from_assertion(equals_bool(true, states && codes && neq, 6002));
+}
+
+test text_checked_construction() -> (result: TestResult) {
+    let full: [byte; 32] = [65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65];
+    let ok: Cell = cell.text_cell(full, 32);
+    let toolong: Cell = cell.text_cell(full, 33);
+    return from_assertion(equals_bool(true, cell.is_kind(ok, CellKind.Text) && cell.invalid_code(toolong) == 3, 6003));
+}
+
+test cell_equality() -> (result: TestResult) {
+    let a: Cell = cell.int_cell(5);
+    let b: Cell = cell.int_cell(5);
+    let c: Cell = cell.int_cell(6);
+    let t1: Cell = cell.text_cell(t32(97, 98, 99, 3), 3);
+    let t2: Cell = cell.text_cell(t32(97, 98, 99, 3), 3);
+    let t3: Cell = cell.text_cell(t32(97, 98, 100, 3), 3);
+    let same_missing: bool = cell.cell_eq(cell.missing_cell(), cell.missing_cell());
+    let ok: bool = cell.cell_eq(a, b) && cell.cell_eq(a, c) == false && cell.cell_eq(t1, t2) && cell.cell_eq(t1, t3) == false;
+    let cross: bool = cell.cell_eq(a, t1) == false && cell.cell_eq(cell.bool_cell(true), cell.bool_cell(false)) == false;
+    return from_assertion(equals_bool(true, same_missing && ok && cross, 6004));
+}
+
+test int_comparison() -> (result: TestResult) {
+    let less: bool = cell.cmp_int(cell.int_cell(1), cell.int_cell(2)) == -1;
+    let eq: bool = cell.cmp_int(cell.int_cell(2), cell.int_cell(2)) == 0;
+    let more: bool = cell.cmp_int(cell.int_cell(3), cell.int_cell(2)) == 1;
+    let unord: bool = cell.cmp_int(cell.missing_cell(), cell.int_cell(2)) == 2 && cell.cmp_int(cell.int_cell(2), cell.invalid_cell(1)) == 2;
+    return from_assertion(equals_bool(true, less && eq && more && unord, 6005));
+}
+
+test payload_projection() -> (result: TestResult) {
+    let iv: IntView = cell.as_int(cell.int_cell(-9));
+    let miss: IntView = cell.as_int(cell.missing_cell());
+    let bv: BoolView = cell.as_bool(cell.bool_cell(true));
+    let wrong: BoolView = cell.as_bool(cell.int_cell(1));
+    let ok: bool = iv.found && iv.value == -9 && miss.found == false && bv.found && bv.value && wrong.found == false;
+    return from_assertion(equals_bool(true, ok, 6006));
+}
+
+// --- schemas ---
+
+test find_column_positions() -> (result: TestResult) {
+    let spec: Schema4 = test_schema();
+    let id_hit: ColumnHit = schema.find_column(spec, schema.pad_name(c8(105, 100, 0, 0, 0, 0, 0, 0), 2), 2);
+    let ok_hit: ColumnHit = schema.find_column(spec, schema.pad_name(c8(111, 107, 0, 0, 0, 0, 0, 0), 2), 2);
+    let no_hit: ColumnHit = schema.find_column(spec, schema.pad_name(c8(122, 122, 122, 0, 0, 0, 0, 0), 3), 3);
+    let ok: bool = id_hit.found && id_hit.index == 0 && ok_hit.found && ok_hit.index == 3 && no_hit.found == false;
+    return from_assertion(equals_bool(true, ok, 6007));
+}
+
+// --- validation ---
+
+test validate_clean_row() -> (result: TestResult) {
+    let checked: Validation = validate.validate_row4(test_schema(), good_row());
+    return from_assertion(equals_bool(true, checked.ok && checked.count == 0, 6008));
+}
+
+test validate_missing_required() -> (result: TestResult) {
+    let m: Cell = cell.missing_cell();
+    let row: [Cell; 4] = [m, cell.text_cell(t32(97, 110, 110, 3), 3), cell.int_cell(33), cell.bool_cell(true)];
+    let checked: Validation = validate.validate_row4(test_schema(), row);
+    let first: FieldFailure = checked.failures[0];
+    let ok: bool = checked.ok == false && checked.count == 1 && first.col == 0 && validate.fail_code(first.kind) == 1;
+    return from_assertion(equals_bool(true, ok, 6009));
+}
+
+test validate_optional_missing_ok() -> (result: TestResult) {
+    let m: Cell = cell.missing_cell();
+    let row: [Cell; 4] = [cell.int_cell(7), m, m, cell.bool_cell(false)];
+    let checked: Validation = validate.validate_row4(test_schema(), row);
+    return from_assertion(equals_bool(true, checked.ok && checked.count == 0, 6010));
+}
+
+test validate_type_mismatch() -> (result: TestResult) {
+    let row: [Cell; 4] = [cell.text_cell(t32(120, 0, 0, 1), 1), cell.text_cell(t32(97, 110, 110, 3), 3), cell.int_cell(33), cell.bool_cell(true)];
+    let checked: Validation = validate.validate_row4(test_schema(), row);
+    let first: FieldFailure = checked.failures[0];
+    let ok: bool = checked.ok == false && first.col == 0 && validate.fail_code(first.kind) == 2 && first.detail == 0;
+    return from_assertion(equals_bool(true, ok, 6011));
+}
+
+test validate_invalid_cell() -> (result: TestResult) {
+    let row: [Cell; 4] = [cell.int_cell(7), cell.text_cell(t32(97, 110, 110, 3), 3), cell.invalid_cell(1), cell.bool_cell(true)];
+    let checked: Validation = validate.validate_row4(test_schema(), row);
+    let first: FieldFailure = checked.failures[0];
+    let ok: bool = checked.ok == false && first.col == 2 && validate.fail_code(first.kind) == 3 && first.detail == 1;
+    return from_assertion(equals_bool(true, ok, 6012));
+}
+
+test validate_generic_width() -> (result: TestResult) {
+    let c0: ColumnSpec = schema.make_column(c8(97, 0, 0, 0, 0, 0, 0, 0), 1, CellKind.Int, true);
+    let c1: ColumnSpec = schema.make_column(c8(98, 0, 0, 0, 0, 0, 0, 0), 1, CellKind.Bool, false);
+    let cols: [ColumnSpec; 2] = [c0, c1];
+    let row: [Cell; 2] = [cell.int_cell(1), cell.missing_cell()];
+    let checked: Validation = validate.validate_row(cols, row);
+    let bad: [Cell; 2] = [cell.missing_cell(), cell.bool_cell(true)];
+    let checked_bad: Validation = validate.validate_row(cols, bad);
+    return from_assertion(equals_bool(true, checked.ok && checked_bad.ok == false, 6013));
+}
+
+// --- tables ---
+
+test push_and_overflow() -> (result: TestResult) {
+    let ticks: [u64; 16] = [0; 16];
+    iterate i over ticks carrying t: Table = table.empty_table(test_schema()) {
+        next t = table.push_row(t, good_row()).table;
+    }
+    let full: PushOut = table.push_row(t, good_row());
+    return from_assertion(equals_bool(true, t.row_count == 16 && full.ok == false && full.overflow, 6014));
+}
+
+test column_extract() -> (result: TestResult) {
+    let t0: Table = table.empty_table(test_schema());
+    let t1: Table = table.push_row(t0, int_row(3, 30, 300, 3000)).table;
+    let t2: Table = table.push_row(t1, int_row(1, 10, 100, 1000)).table;
+    let col: ColumnVec = table.column_vector(t2, 0);
+    let v0: IntView = cell.as_int(col.cells[0]);
+    let v1: IntView = cell.as_int(col.cells[1]);
+    let ok: bool = col.len == 2 && v0.value == 3 && v1.value == 1;
+    return from_assertion(equals_bool(true, ok, 6015));
+}
+
+test table_report_clean() -> (result: TestResult) {
+    let t0: Table = table.empty_table(test_schema());
+    let t1: Table = table.push_row(t0, good_row()).table;
+    let report: TableReport = table.validate_table(t1);
+    return from_assertion(equals_bool(true, report.ok && report.bad_rows == 0, 6016));
+}
+
+test table_report_names_first_bad() -> (result: TestResult) {
+    let m: Cell = cell.missing_cell();
+    let bad: [Cell; 4] = [m, cell.text_cell(t32(98, 111, 98, 3), 3), cell.int_cell(5), cell.bool_cell(true)];
+    let t0: Table = table.empty_table(test_schema());
+    let t1: Table = table.push_row(t0, good_row()).table;
+    let t2: Table = table.push_row(t1, bad).table;
+    let t3: Table = table.push_row(t2, bad).table;
+    let report: TableReport = table.validate_table(t3);
+    let ok: bool = report.ok == false && report.bad_rows == 2 && report.first_bad_row == 1 && report.first_col == 0 && report.first_code == 1;
+    return from_assertion(equals_bool(true, ok, 6017));
+}
+
+// --- operators ---
+
+test predicate_codes() -> (result: TestResult) {
+    let e: bool = ops.pred_code(IntPred.Eq) == 0;
+    let n: bool = ops.pred_code(IntPred.Ne) == 1;
+    let g: bool = ops.pred_code(IntPred.Gt) == 2;
+    let l: bool = ops.pred_code(IntPred.Lt) == 3;
+    let ge: bool = ops.pred_code(IntPred.Ge) == 4;
+    let le: bool = ops.pred_code(IntPred.Le) == 5;
+    return from_assertion(equals_bool(true, e && n && g && l && ge && le, 6018));
+}
+
+test filter_keeps_matches() -> (result: TestResult) {
+    let t0: Table = table.empty_table(test_schema());
+    let t1: Table = table.push_row(t0, int_row(1, 0, 20, 0)).table;
+    let t2: Table = table.push_row(t1, int_row(2, 0, 40, 0)).table;
+    let t3: Table = table.push_row(t2, int_row(3, 0, 30, 0)).table;
+    let pred: RowPred = RowPred { col: 2, pred: IntPred.Gt, arg: 25 };
+    let kept: Table = ops.filter_table(t3, pred);
+    let col: ColumnVec = table.column_vector(kept, 0);
+    let v0: IntView = cell.as_int(col.cells[0]);
+    let v1: IntView = cell.as_int(col.cells[1]);
+    let ok: bool = kept.row_count == 2 && v0.value == 2 && v1.value == 3;
+    return from_assertion(equals_bool(true, ok, 6019));
+}
+
+test filter_skips_missing() -> (result: TestResult) {
+    let m: Cell = cell.missing_cell();
+    let gap: [Cell; 4] = [cell.int_cell(9), cell.int_cell(0), m, cell.int_cell(0)];
+    let t0: Table = table.empty_table(test_schema());
+    let t1: Table = table.push_row(t0, gap).table;
+    let t2: Table = table.push_row(t1, int_row(8, 0, 1, 0)).table;
+    let pred: RowPred = RowPred { col: 2, pred: IntPred.Ne, arg: 1 };
+    let kept: Table = ops.filter_table(t2, pred);
+    return from_assertion(equals_bool(true, kept.row_count == 0, 6020));
+}
+
+test sort_ascending_missing_last() -> (result: TestResult) {
+    let m: Cell = cell.missing_cell();
+    let gap: [Cell; 4] = [m, cell.int_cell(0), cell.int_cell(9), cell.int_cell(0)];
+    let t0: Table = table.empty_table(test_schema());
+    let t1: Table = table.push_row(t0, int_row(3, 0, 0, 0)).table;
+    let t2: Table = table.push_row(t1, int_row(1, 0, 0, 0)).table;
+    let t3: Table = table.push_row(t2, gap).table;
+    let t4: Table = table.push_row(t3, int_row(2, 0, 0, 0)).table;
+    let sorted: Table = ops.sort_table(t4, 0, true);
+    let col: ColumnVec = table.column_vector(sorted, 0);
+    let v0: IntView = cell.as_int(col.cells[0]);
+    let v1: IntView = cell.as_int(col.cells[1]);
+    let v2: IntView = cell.as_int(col.cells[2]);
+    let v3: IntView = cell.as_int(col.cells[3]);
+    let ok: bool = sorted.row_count == 4 && v0.value == 1 && v1.value == 2 && v2.value == 3 && v3.found == false;
+    return from_assertion(equals_bool(true, ok, 6021));
+}
+
+test sort_descending_stable() -> (result: TestResult) {
+    let t0: Table = table.empty_table(test_schema());
+    let t1: Table = table.push_row(t0, int_row(1, 0, 5, 0)).table;
+    let t2: Table = table.push_row(t1, int_row(2, 0, 9, 0)).table;
+    let t3: Table = table.push_row(t2, int_row(3, 0, 9, 0)).table;
+    let t4: Table = table.push_row(t3, int_row(4, 0, 1, 0)).table;
+    let sorted: Table = ops.sort_table(t4, 2, false);
+    let col: ColumnVec = table.column_vector(sorted, 0);
+    let v0: IntView = cell.as_int(col.cells[0]);
+    let v1: IntView = cell.as_int(col.cells[1]);
+    let v2: IntView = cell.as_int(col.cells[2]);
+    let v3: IntView = cell.as_int(col.cells[3]);
+    let ok: bool = v0.value == 2 && v1.value == 3 && v2.value == 1 && v3.value == 4;
+    return from_assertion(equals_bool(true, ok, 6022));
+}
+
+test sum_skips_missing_reports_invalid() -> (result: TestResult) {
+    let m: Cell = cell.missing_cell();
+    let cells: [Cell; 16] = [cell.int_cell(10), m, cell.int_cell(-4), cell.invalid_cell(1), m, m, m, m, m, m, m, m, m, m, m, m];
+    let col: ColumnVec = ColumnVec { cells: cells, len: 4 };
+    let agg: IntAgg = ops.sum_int(col);
+    let ok: bool = agg.total == 6 && agg.valid == 2 && agg.skipped_missing == 1 && agg.invalid_seen == 1;
+    return from_assertion(equals_bool(true, ok, 6023));
+}
+
+test extent_empty_unfound() -> (result: TestResult) {
+    let m: Cell = cell.missing_cell();
+    let cells: [Cell; 16] = [cell.int_cell(7), cell.int_cell(2), cell.int_cell(9), m, m, m, m, m, m, m, m, m, m, m, m, m];
+    let col: ColumnVec = ColumnVec { cells: cells, len: 4 };
+    let lo: IntExtent = ops.extent_int(col, true);
+    let hi: IntExtent = ops.extent_int(col, false);
+    let empty_col: ColumnVec = ColumnVec { cells: cells, len: 0 };
+    let none: IntExtent = ops.extent_int(empty_col, true);
+    let ok: bool = lo.found && lo.value == 2 && hi.found && hi.value == 9 && none.found == false;
+    return from_assertion(equals_bool(true, ok, 6024));
+}
+
+test project_narrows() -> (result: TestResult) {
+    let row: [Cell; 4] = good_row();
+    let order: [u64; 2] = [3, 0];
+    let narrow: [Cell; 2] = ops.project2(row, order);
+    let wide: [u64; 2] = [4, 9];
+    let back: [Cell; 2] = ops.project2(row, wide);
+    let b0: BoolView = cell.as_bool(narrow[0]);
+    let i1: IntView = cell.as_int(narrow[1]);
+    let fill0: BoolView = cell.as_bool(back[0]);
+    let fill1: BoolView = cell.as_bool(back[1]);
+    let ok: bool = b0.found && b0.value && i1.found && i1.value == 7 && fill0.found == false && fill1.found == false;
+    return from_assertion(equals_bool(true, ok, 6025));
+}
+
+test count_states_generic() -> (result: TestResult) {
+    let m: Cell = cell.missing_cell();
+    let cells: [Cell; 6] = [cell.int_cell(1), m, cell.invalid_cell(2), cell.bool_cell(true), m, cell.int_cell(3)];
+    let counts: CellCounts = ops.count_states(cells, 6);
+    return from_assertion(equals_bool(true, counts.valid == 3 && counts.missing == 2 && counts.invalid == 1, 6026));
+}
+
+// --- determinism and notes ---
+
+test filter_idempotent() -> (result: TestResult) {
+    let t0: Table = table.empty_table(test_schema());
+    let t1: Table = table.push_row(t0, int_row(1, 0, 20, 0)).table;
+    let t2: Table = table.push_row(t1, int_row(2, 0, 40, 0)).table;
+    let pred: RowPred = RowPred { col: 2, pred: IntPred.Ge, arg: 20 };
+    let once: Table = ops.filter_table(t2, pred);
+    let twice: Table = ops.filter_table(once, pred);
+    let ok: bool = once.row_count == 2 && image.table_digest(once) == image.table_digest(twice);
+    return from_assertion(equals_bool(true, ok, 6027));
+}
+
+test sort_preserves_multiset() -> (result: TestResult) {
+    let t0: Table = table.empty_table(test_schema());
+    let t1: Table = table.push_row(t0, int_row(3, 0, 0, 0)).table;
+    let t2: Table = table.push_row(t1, int_row(1, 0, 0, 0)).table;
+    let t3: Table = table.push_row(t2, int_row(2, 0, 0, 0)).table;
+    let sorted: Table = ops.sort_table(t3, 0, true);
+    let before: IntAgg = ops.sum_int(table.column_vector(t3, 0));
+    let after: IntAgg = ops.sum_int(table.column_vector(sorted, 0));
+    let col: ColumnVec = table.column_vector(sorted, 0);
+    let v0: IntView = cell.as_int(col.cells[0]);
+    let v1: IntView = cell.as_int(col.cells[1]);
+    let v2: IntView = cell.as_int(col.cells[2]);
+    let ordered: bool = v0.value <= v1.value && v1.value <= v2.value;
+    return from_assertion(equals_bool(true, before.total == after.total && before.valid == after.valid && ordered, 6028));
+}
+
+test digests_separate_order() -> (result: TestResult) {
+    let again: Table = table.push_row(table.push_row(table.empty_table(test_schema()), int_row(1, 0, 0, 0)).table, int_row(2, 0, 0, 0)).table;
+    let t0: Table = table.empty_table(test_schema());
+    let t1: Table = table.push_row(t0, int_row(2, 0, 0, 0)).table;
+    let t2: Table = table.push_row(t1, int_row(1, 0, 0, 0)).table;
+    let same: bool = image.table_digest(again) == image.table_digest(again);
+    let apart: bool = image.table_digest(again) == image.table_digest(t2) == false;
+    let note: TransformNote = image.note(1, image.table_digest(t2), image.table_digest(again));
+    let linked: bool = note.op == 1 && note.input_digest == image.table_digest(t2) && note.output_digest == image.table_digest(again);
+    return from_assertion(equals_bool(true, same && apart && linked, 6029));
+}

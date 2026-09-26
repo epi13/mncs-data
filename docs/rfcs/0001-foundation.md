@@ -1,6 +1,6 @@
 # RFC 0001: Data pipeline foundation
 
-Status: Draft
+Status: Implemented (2026-09-26: typed cells, schemas, validation, table ops, CSV interchange, digests, and native suites landed)
 
 ## Principles
 

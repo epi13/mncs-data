@@ -1,0 +1,335 @@
+mncs 0.18;
+
+// mncs.data.csv.v1 — deterministic CSV interchange for canonical tables.
+//
+// CSV is an interoperability boundary, not the data model (Store holds
+// the same position: boundary formats are not canonical). This module
+// owns both directions across that boundary: typed rows to bytes and
+// bounded byte windows back to typed cells. Parsing never traps and
+// never drops rows silently: malformed fields become Invalid cells,
+// ragged lines report status, and validation downstream decides.
+//
+// Canonical encoding (documented, tested, byte-exact):
+//   Int     decimal, optional leading `-`, no `+`, no spaces
+//   Text    raw bytes (no quoting; `"` passes through literally)
+//   Bool    `true` / `false` exactly
+//   Missing empty field
+//   Invalid `!` followed by the decimal code (`!1`, `!2`, `!3`)
+// Lines end at the window end (no terminator inside the buffer); one
+// trailing CR is stripped as interop normalization. The header line
+// carries column names; the caller skips it explicitly on input.
+//
+// Bounds: one line is at most 256 bytes; fields past the 4th flag
+// Ragged; text past 32 bytes reports Invalid(3). Callers that cut a
+// longer line to the window pass `was_truncated`, which surfaces as
+// the Truncated status instead of silent loss.
+
+module mncs.data.csv.v1;
+
+use mncs.data.cell.v1 as cell;
+use mncs.data.schema.v1 as schema;
+
+enum LineStatus { Ok, Ragged, Truncated, Empty }
+
+record LineBuf {
+    bytes: [byte; 256],
+    len: u64,
+    ok: bool
+}
+
+record ParseRow {
+    cells: [Cell; 4],
+    n: u64,
+    status: LineStatus
+}
+
+record IntParse {
+    ok: bool,
+    value: i64
+}
+
+record SplitState {
+    starts: [u64; 8],
+    lens: [u64; 8],
+    count: u64,
+    cur: u64,
+    ragged: bool
+}
+
+fn line_code(status: LineStatus) -> (result: u64) {
+    return match status {
+        LineStatus.Ok => 0,
+        LineStatus.Ragged => 1,
+        LineStatus.Truncated => 2,
+        LineStatus.Empty => 3,
+    };
+}
+
+fn open_line() -> (result: LineBuf) {
+    return LineBuf { bytes: [0; 256], len: 0, ok: true };
+}
+
+fn put_byte(buf: LineBuf, value: byte) -> (result: LineBuf) {
+    if buf.ok && buf.len < 256 {
+        return LineBuf { ..buf, bytes: replace(buf.bytes, buf.len, value), len: buf.len +% 1 };
+    }
+    return LineBuf { ..buf, ok: false };
+}
+
+fn put_chunk(buf: LineBuf, src: [byte; 8], src_len: u64) -> (result: LineBuf) {
+    let live: u64 = select(src_len <= 8, src_len, 8);
+    if buf.ok && buf.len +% live <= 256 {
+        return LineBuf {
+            ..buf,
+            bytes: copy_span(buf.bytes, buf.len, src, 0, live),
+            len: buf.len +% live
+        };
+    }
+    return LineBuf { ..buf, ok: false };
+}
+
+fn put_text(buf: LineBuf, src: [byte; 32], src_len: u64) -> (result: LineBuf) {
+    let live: u64 = select(src_len <= 32, src_len, 32);
+    if buf.ok && buf.len +% live <= 256 {
+        return LineBuf {
+            ..buf,
+            bytes: copy_span(buf.bytes, buf.len, src, 0, live),
+            len: buf.len +% live
+        };
+    }
+    return LineBuf { ..buf, ok: false };
+}
+
+// Unsigned magnitude rendering by a fixed divisor table.
+fn put_u64(buf: LineBuf, value: u64) -> (result: LineBuf) {
+    let divs: [u64; 20] = [10000000000000000000, 1000000000000000000, 100000000000000000, 10000000000000000, 1000000000000000, 100000000000000, 10000000000000, 1000000000000, 100000000000, 10000000000, 1000000000, 100000000, 10000000, 1000000, 100000, 10000, 1000, 100, 10, 1];
+    iterate i over divs carrying st: DigitState = DigitState { buf: buf, rest: value, started: false } {
+        next st = put_digit(st, divs[i]);
+    }
+    return st.buf;
+}
+
+record DigitState {
+    buf: LineBuf,
+    rest: u64,
+    started: bool
+}
+
+fn put_digit(st: DigitState, div: u64) -> (result: DigitState) {
+    let digit: u64 = st.rest / div;
+    let emit: bool = st.started || digit != 0 || div == 1;
+    let grown: LineBuf = select(emit, put_byte(st.buf, (48 +% digit) as byte), st.buf);
+    return DigitState { buf: grown, rest: st.rest % div, started: st.started || emit };
+}
+
+// Signed rendering: `-` plus magnitude. i64 MIN is guarded
+// explicitly so the negation path stays total on every input.
+fn put_i64(buf: LineBuf, value: i64) -> (result: LineBuf) {
+    if value < 0 {
+        return put_u64(put_byte(buf, 45), neg_magnitude(value));
+    }
+    return put_u64(buf, value as u64);
+}
+
+fn neg_magnitude(value: i64) -> (result: u64) {
+    if value == -9223372036854775808 {
+        return 9223372036854775808;
+    }
+    return (0 - value) as u64;
+}
+
+fn emit_cell(buf: LineBuf, current: Cell) -> (result: LineBuf) {
+    return match current {
+        Cell.Int { value } => put_i64(buf, value),
+        Cell.Text { bytes, len } => put_text(buf, bytes, len),
+        Cell.Bool { value } => select(value, put_chunk(buf, word_true(), 4), put_chunk(buf, word_false(), 5)),
+        Cell.Missing => buf,
+        Cell.Invalid { code } => put_u64(put_byte(buf, 33), code),
+    };
+}
+
+fn word_true() -> (result: [byte; 8]) {
+    return [116, 114, 117, 101, 0, 0, 0, 0];
+}
+
+fn word_false() -> (result: [byte; 8]) {
+    return [102, 97, 108, 115, 101, 0, 0, 0];
+}
+
+fn emit_row(row: [Cell; 4]) -> (result: LineBuf) {
+    let s0: LineBuf = emit_cell(open_line(), row[0]);
+    let s1: LineBuf = emit_cell(put_byte(s0, 44), row[1]);
+    let s2: LineBuf = emit_cell(put_byte(s1, 44), row[2]);
+    return emit_cell(put_byte(s2, 44), row[3]);
+}
+
+fn emit_header(schema_value: Schema4) -> (result: LineBuf) {
+    let cols: [ColumnSpec; 4] = schema_value.cols;
+    let n0: ColumnSpec = cols[0];
+    let n1: ColumnSpec = cols[1];
+    let n2: ColumnSpec = cols[2];
+    let n3: ColumnSpec = cols[3];
+    let s0: LineBuf = put_text(open_line(), n0.name, n0.name_len);
+    let s1: LineBuf = put_text(put_byte(s0, 44), n1.name, n1.name_len);
+    let s2: LineBuf = put_text(put_byte(s1, 44), n2.name, n2.name_len);
+    return put_text(put_byte(s2, 44), n3.name, n3.name_len);
+}
+
+// --- parsing: bounded byte windows back to typed cells ---
+
+fn initial_split() -> (result: SplitState) {
+    return SplitState {
+        starts: [0; 8],
+        lens: [0; 8],
+        count: 0,
+        cur: 0,
+        ragged: false
+    };
+}
+
+// Record the field ending at `pos` when the window allows; further
+// commas only set the ragged flag.
+fn cut_field(state: SplitState, pos: u64) -> (result: SplitState) {
+    if state.count < 8 {
+        let slot: u64 = select(state.count < 8, state.count, 0);
+        return SplitState {
+            starts: replace(state.starts, slot, state.cur),
+            lens: replace(state.lens, slot, pos -% state.cur),
+            count: state.count +% 1,
+            cur: pos +% 1,
+            ragged: state.ragged
+        };
+    }
+    return SplitState { ..state, ragged: true };
+}
+
+fn split_fields(line: [byte; up_to 256], live: u64) -> (result: SplitState) {
+    iterate i over line carrying state: SplitState = initial_split() {
+        let here: bool = i < live;
+        let slot: u64 = select(i < live && i < line.len, i, 0);
+        let comma: bool = here && line[slot] == 44;
+        next state = select(comma, cut_field(state, i), state);
+    }
+    return cut_field(state, live);
+}
+
+// Copy one field into an 8-byte chunk for fixed-word comparison.
+// The caller guarantees `len <= 8`.
+fn field_chunk(line: [byte; up_to 256], start: u64, len: u64) -> (result: [byte; 8]) {
+    let blank: [byte; 8] = [0; 8];
+    let take: u64 = select(len <= 8, len, 8);
+    return copy_span(blank, 0, line, start, take);
+}
+
+fn field_is_true(line: [byte; up_to 256], start: u64, len: u64) -> (result: bool) {
+    if len == 4 {
+        let chunk: [byte; 8] = field_chunk(line, start, 4);
+        return chunk[0] == 116 && chunk[1] == 114 && chunk[2] == 117 && chunk[3] == 101;
+    }
+    return false;
+}
+
+fn parse_bool_field(line: [byte; up_to 256], start: u64, len: u64) -> (result: Cell) {
+    if field_is_true(line, start, len) {
+        return cell.bool_cell(true);
+    }
+    if len == 5 {
+        let chunk: [byte; 8] = field_chunk(line, start, 5);
+        if chunk[0] == 102 && chunk[1] == 97 && chunk[2] == 108 && chunk[3] == 115 && chunk[4] == 101 {
+            return cell.bool_cell(false);
+        }
+    }
+    return cell.invalid_cell(2);
+}
+
+record IntAcc {
+    value: i64,
+    ok: bool
+}
+
+fn parse_int_field(line: [byte; up_to 256], start: u64, len: u64, live: u64) -> (result: Cell) {
+    if len == 0 {
+        return cell.invalid_cell(1);
+    }
+    let first: u64 = select(start < live && start < line.len, start, 0);
+    let neg: bool = start < live && line[first] == 45;
+    let digits: u64 = len -% select(neg, 1, 0);
+    if digits == 0 || digits > 19 {
+        return cell.invalid_cell(1);
+    }
+    let base: u64 = start +% select(neg, 1, 0);
+    iterate i over line carrying acc: IntAcc = IntAcc { value: 0, ok: true } {
+        next acc = fold_digit(acc, line, live, base, digits, i);
+    }
+    if acc.ok {
+        if neg {
+            return cell.int_cell(0 - acc.value);
+        }
+        return cell.int_cell(acc.value);
+    }
+    return cell.invalid_cell(1);
+}
+
+fn fold_digit(acc: IntAcc, line: [byte; up_to 256], live: u64, base: u64, digits: u64, i: u64) -> (result: IntAcc) {
+    let active: bool = i >= base && i < base +% digits && i < live;
+    if active {
+        let slot: u64 = select(i < live && i < line.len, i, 0);
+        let digit: i64 = (line[slot] as i64) - 48;
+        if digit < 0 || digit > 9 {
+            return IntAcc { value: acc.value, ok: false };
+        }
+        if acc.value > (9223372036854775807 - digit) / 10 {
+            return IntAcc { value: acc.value, ok: false };
+        }
+        return IntAcc { value: acc.value * 10 + digit, ok: acc.ok };
+    }
+    return acc;
+}
+
+fn parse_text_field(line: [byte; up_to 256], start: u64, len: u64) -> (result: Cell) {
+    if len <= 32 {
+        let blank: [byte; 32] = [0; 32];
+        return cell.text_cell(copy_span(blank, 0, line, start, len), len);
+    }
+    return cell.invalid_cell(3);
+}
+
+// One schema-directed field: empty is always Missing; the column kind
+// decides how present bytes are read.
+fn parse_field(schema_value: Schema4, col: u64, line: [byte; up_to 256], start: u64, len: u64, live: u64) -> (result: Cell) {
+    let cols: [ColumnSpec; 4] = schema_value.cols;
+    let slot: u64 = select(col < 4, col, 0);
+    let entry: ColumnSpec = cols[slot];
+    if len == 0 {
+        return cell.missing_cell();
+    }
+    return match entry.kind {
+        CellKind.Int => parse_int_field(line, start, len, live),
+        CellKind.Text => parse_text_field(line, start, len),
+        CellKind.Bool => parse_bool_field(line, start, len),
+    };
+}
+
+// Parse one line against the schema. Short rows pad Missing; rows past
+// 4 fields parse their first 4 and report Ragged; a caller-truncated
+// line still parses but reports Truncated; an empty line is Empty.
+fn parse_typed(schema_value: Schema4, line: [byte; up_to 256], len: u64, was_truncated: bool) -> (result: ParseRow) {
+    let m: Cell = cell.missing_cell();
+    let blank: [Cell; 4] = [m, m, m, m];
+    let live: u64 = select(len <= line.len, len, line.len);
+    if live == 0 {
+        return ParseRow { cells: blank, n: 0, status: LineStatus.Empty };
+    }
+    let last: u64 = live -% 1;
+    let last_slot: u64 = select(last < live && last < line.len, last, 0);
+    let body: u64 = select(line[last_slot] == 13, last, live);
+    let split: SplitState = split_fields(line, body);
+    let status: LineStatus = select(split.count > 4 || split.ragged, LineStatus.Ragged, LineStatus.Ok);
+    let c0: Cell = parse_field(schema_value, 0, line, split.starts[0], select(split.count > 0, split.lens[0], 0), body);
+    let c1: Cell = parse_field(schema_value, 1, line, split.starts[1], select(split.count > 1, split.lens[1], 0), body);
+    let c2: Cell = parse_field(schema_value, 2, line, split.starts[2], select(split.count > 2, split.lens[2], 0), body);
+    let c3: Cell = parse_field(schema_value, 3, line, split.starts[3], select(split.count > 3, split.lens[3], 0), body);
+    let n: u64 = select(split.count <= 4, split.count, 4);
+    let flagged: LineStatus = select(was_truncated, LineStatus.Truncated, status);
+    return ParseRow { cells: [c0, c1, c2, c3], n: n, status: flagged };
+}

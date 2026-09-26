@@ -1,0 +1,234 @@
+mncs 0.18;
+
+// mncs.data.cell.v1 — the typed cell value model.
+//
+// A Cell is one field of one row. The model keeps four states that
+// messy data actually needs, and refuses to collapse them:
+//
+//   Int / Text / Bool  present, well-typed values
+//   Missing            no value was present (empty CSV field, absent input)
+//   Invalid            a value was present but malformed, with a code
+//
+// Missing is not zero, not empty text, and not false. Invalid is not
+// Missing: `!1` records that `abc` failed integer parsing in an Int
+// column, so validation and debugging can point at the cause instead
+// of silently substituting.
+//
+// Invalid codes: 1 = bad integer text, 2 = bad boolean text,
+// 3 = text truncated past the 32-byte window.
+//
+// Text cells carry at most 32 bytes; constructors truncate explicitly
+// and report Invalid(3) through the checked path, never silently.
+// There is deliberately no Float cell in this slice: CSV interchange,
+// identifiers, counts, categories, and flags are fully served, while
+// float ordering and NaN semantics belong with a Numeric-coherent
+// design (recorded as a non-goal, not an oversight).
+
+module mncs.data.cell.v1;
+
+enum Cell {
+    Int { value: i64 },
+    Text { bytes: [byte; 32], len: u64 },
+    Bool { value: bool },
+    Missing,
+    Invalid { code: u64 }
+}
+
+enum CellKind { Int, Text, Bool }
+
+fn int_cell(value: i64) -> (result: Cell) {
+    return Cell.Int { value: value };
+}
+
+fn bool_cell(value: bool) -> (result: Cell) {
+    return Cell.Bool { value: value };
+}
+
+fn missing_cell() -> (result: Cell) {
+    return Cell.Missing;
+}
+
+fn invalid_cell(code: u64) -> (result: Cell) {
+    return Cell.Invalid { code: code };
+}
+
+// Checked text construction: overlong input reports Invalid(3) with
+// the head bytes retained for diagnosis instead of silent truncation.
+fn text_cell(bytes: [byte; 32], len: u64) -> (result: Cell) {
+    if len <= 32 {
+        return Cell.Text { bytes: bytes, len: len };
+    }
+    return Cell.Invalid { code: 3 };
+}
+
+// Whether the cell carries the queried kind. Missing and Invalid
+// never match: they are states of the cell, not types of a value,
+// and only validation decides what they mean per column.
+fn is_kind(cell: Cell, kind: CellKind) -> (result: bool) {
+    return match cell {
+        Cell.Int { value } => match kind {
+            CellKind.Int => true,
+            CellKind.Text => false,
+            CellKind.Bool => false,
+        },
+        Cell.Text { bytes, len } => match kind {
+            CellKind.Int => false,
+            CellKind.Text => true,
+            CellKind.Bool => false,
+        },
+        Cell.Bool { value } => match kind {
+            CellKind.Int => false,
+            CellKind.Text => false,
+            CellKind.Bool => true,
+        },
+        Cell.Missing => false,
+        Cell.Invalid { code } => false,
+    };
+}
+
+fn is_missing(cell: Cell) -> (result: bool) {
+    return match cell {
+        Cell.Int { value } => false,
+        Cell.Text { bytes, len } => false,
+        Cell.Bool { value } => false,
+        Cell.Missing => true,
+        Cell.Invalid { code } => false,
+    };
+}
+
+fn is_invalid(cell: Cell) -> (result: bool) {
+    return match cell {
+        Cell.Int { value } => false,
+        Cell.Text { bytes, len } => false,
+        Cell.Bool { value } => false,
+        Cell.Missing => false,
+        Cell.Invalid { code } => true,
+    };
+}
+
+record IntView {
+    found: bool,
+    value: i64
+}
+
+record BoolView {
+    found: bool,
+    value: bool
+}
+
+// Total payload projections. Non-Int (respectively non-Bool) cells
+// report `found = false` with a zero value — never a trap, never a
+// silent coercion.
+fn as_int(current: Cell) -> (result: IntView) {
+    return match current {
+        Cell.Int { value } => IntView { found: true, value: value },
+        Cell.Text { bytes, len } => IntView { found: false, value: 0 },
+        Cell.Bool { value } => IntView { found: false, value: 0 },
+        Cell.Missing => IntView { found: false, value: 0 },
+        Cell.Invalid { code } => IntView { found: false, value: 0 },
+    };
+}
+
+fn as_bool(current: Cell) -> (result: BoolView) {
+    return match current {
+        Cell.Int { value } => BoolView { found: false, value: false },
+        Cell.Text { bytes, len } => BoolView { found: false, value: false },
+        Cell.Bool { value } => BoolView { found: true, value: value },
+        Cell.Missing => BoolView { found: false, value: false },
+        Cell.Invalid { code } => BoolView { found: false, value: false },
+    };
+}
+
+// Invalid code, or 0 for cells that are not invalid.
+fn invalid_code(cell: Cell) -> (result: u64) {
+    return match cell {
+        Cell.Int { value } => 0,
+        Cell.Text { bytes, len } => 0,
+        Cell.Bool { value } => 0,
+        Cell.Missing => 0,
+        Cell.Invalid { code } => code,
+    };
+}
+
+// Numeric kind projection for hosts and tests (the language has no
+// enum equality): Int 0, Text 1, Bool 2.
+fn kind_code(kind: CellKind) -> (result: u64) {
+    return match kind {
+        CellKind.Int => 0,
+        CellKind.Text => 1,
+        CellKind.Bool => 2,
+    };
+}
+
+// Exact cell equality: same variant with equal payloads. Missing
+// equals Missing; Invalid equals Invalid only on equal codes. Float
+// semantics do not arise: there is no Float cell.
+fn cell_eq(left: Cell, right: Cell) -> (result: bool) {
+    return match left {
+        Cell.Int { value } => match right {
+            Cell.Int { value: other } => value == other,
+            Cell.Text { bytes, len } => false,
+            Cell.Bool { value: other } => false,
+            Cell.Missing => false,
+            Cell.Invalid { code } => false,
+        },
+        Cell.Text { bytes, len } => match right {
+            Cell.Int { value } => false,
+            Cell.Text { bytes: other, len: other_len } => text_bytes_eq(bytes, len, other, other_len),
+            Cell.Bool { value } => false,
+            Cell.Missing => false,
+            Cell.Invalid { code } => false,
+        },
+        Cell.Bool { value } => match right {
+            Cell.Int { value: other } => false,
+            Cell.Text { bytes, len } => false,
+            Cell.Bool { value: other } => value == other,
+            Cell.Missing => false,
+            Cell.Invalid { code } => false,
+        },
+        Cell.Missing => match right {
+            Cell.Int { value } => false,
+            Cell.Text { bytes, len } => false,
+            Cell.Bool { value } => false,
+            Cell.Missing => true,
+            Cell.Invalid { code } => false,
+        },
+        Cell.Invalid { code } => match right {
+            Cell.Int { value } => false,
+            Cell.Text { bytes, len } => false,
+            Cell.Bool { value } => false,
+            Cell.Missing => false,
+            Cell.Invalid { code: other } => code == other,
+        },
+    };
+}
+
+fn text_bytes_eq(left: [byte; 32], left_len: u64, right: [byte; 32], right_len: u64) -> (result: bool) {
+    if left_len == right_len && left_len <= 32 {
+        iterate i over left carrying same: bool = true {
+            let live: bool = i < left_len;
+            next same = same && select(live, left[i] == right[i], true);
+        }
+        return same;
+    }
+    return false;
+}
+
+// Total ordering over Int cells for key comparison: -1, 0, 1.
+// Non-Int cells are unordered and report 2 (not less, equal, greater,
+// or missing — the caller decides placement explicitly).
+fn cmp_int(left: Cell, right: Cell) -> (result: i64) {
+    return match left {
+        Cell.Int { value } => match right {
+            Cell.Int { value: other } => select(value < other, -1, select(value > other, 1, 0)),
+            Cell.Text { bytes, len } => 2,
+            Cell.Bool { value: other } => 2,
+            Cell.Missing => 2,
+            Cell.Invalid { code } => 2,
+        },
+        Cell.Text { bytes, len } => 2,
+        Cell.Bool { value } => 2,
+        Cell.Missing => 2,
+        Cell.Invalid { code } => 2,
+    };
+}

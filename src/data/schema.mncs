@@ -1,0 +1,81 @@
+mncs 0.18;
+
+// mncs.data.schema.v1 — explicit schemas for the canonical 4-column window.
+//
+// A Schema4 names four columns and fixes each column's kind and
+// required flag. Schemas are explicit data: inference is a separate
+// fallible operation Data does not perform in this slice (the
+// contributor contract distinguishes inference from validation).
+// One schema describes one table shape; versioning machinery is
+// unnecessary while Data controls all consumers, so the canonical
+// schema upgrades normally with no parallel ladders.
+//
+// Column names are at most 8 bytes of explicit spelling. The 4-column
+// window is the canonical interactive slice; the generic validation
+// core in `mncs.data.validate` works over any `[ColumnSpec; C]`.
+
+module mncs.data.schema.v1;
+
+use mncs.data.cell.v1 as cell;
+use mncs.std.text_view.v1 as text;
+
+record ColumnSpec {
+    name: [byte; 32],
+    name_len: u64,
+    kind: CellKind,
+    required: bool
+}
+
+record Schema4 {
+    cols: [ColumnSpec; 4]
+}
+
+record ColumnHit {
+    found: bool,
+    index: u64
+}
+
+// Pad one 8-byte spelling chunk into the 32-byte name window.
+fn pad_name(chunk: [byte; 8], len: u64) -> (result: [byte; 32]) {
+    let blank: [byte; 32] = [0; 32];
+    let live: u64 = select(len <= 8, len, 8);
+    return copy_span(blank, 0, chunk, 0, live);
+}
+
+fn make_column(chunk: [byte; 8], name_len: u64, kind: CellKind, required: bool) -> (result: ColumnSpec) {
+    return ColumnSpec {
+        name: pad_name(chunk, name_len),
+        name_len: select(name_len <= 8, name_len, 8),
+        kind: kind,
+        required: required
+    };
+}
+
+fn make_schema(c0: ColumnSpec, c1: ColumnSpec, c2: ColumnSpec, c3: ColumnSpec) -> (result: Schema4) {
+    return Schema4 { cols: [c0, c1, c2, c3] };
+}
+
+// Match a 32-byte name window against a column spelling.
+fn name_matches(value: [byte; 32], value_len: u64, target: [byte; 32], target_len: u64) -> (result: bool) {
+    if value_len == target_len && value_len <= 32 {
+        return text.matches32(value, value_len, target, target_len);
+    }
+    return false;
+}
+
+// Look up a column by name spelling. Duplicate names resolve to the
+// LAST entry, deterministically; schemas should still avoid them.
+fn find_column(schema: Schema4, name: [byte; 32], name_len: u64) -> (result: ColumnHit) {
+    let cols: [ColumnSpec; 4] = schema.cols;
+    iterate i over cols carrying hit: ColumnHit = ColumnHit { found: false, index: 0 } {
+        let entry: ColumnSpec = cols[i];
+        let is_hit: bool = name_matches(name, name_len, entry.name, entry.name_len);
+        next hit = select(is_hit, ColumnHit { found: true, index: i }, hit);
+    }
+    return hit;
+}
+
+// The column kind as a code (no enum equality): Int 0, Text 1, Bool 2.
+fn column_kind_code(entry: ColumnSpec) -> (result: u64) {
+    return cell.kind_code(entry.kind);
+}

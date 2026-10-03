@@ -1,5 +1,8 @@
 # mncs-data
 
+<!-- MNCS:generated:begin -->
+<!-- MNCS:generated:end -->
+
 The smallest coherent typed data layer MNCS actually needs: explicit
 schemas, honest missing/invalid cell semantics, schema validation with
 structured failures, small composable table transforms, deterministic

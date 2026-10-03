@@ -1,0 +1,22 @@
+{
+  "capabilities": [
+    {
+      "contract": "typed-data",
+      "fingerprint_sources": [
+        "src/data/"
+      ],
+      "kind": "mncs-library",
+      "stability": "experimental",
+      "version": "0.1"
+    }
+  ],
+  "dependencies": [],
+  "entry": [
+    "python3 scripts/run_tests.py"
+  ],
+  "purpose": "The smallest coherent typed data layer MNCS actually needs: explicit schemas, honest missing/invalid cell semantics, schema validation, composable table transforms, deterministic CSV interchange, and content digests for the Store/Lineage boundary.",
+  "repository": "mncs-data",
+  "schema_version": "mncs.project-view/1",
+  "source_identity": "sha256:5bb55af5914ee3517988feb9a175b0a31d2b7701e13c29a09e3ed71702d8ac6f",
+  "structure": {}
+}

@@ -1,6 +1,19 @@
 # mncs-data
 
 <!-- MNCS:generated:begin -->
+## Project entry
+
+The smallest coherent typed data layer MNCS actually needs: explicit schemas, honest missing/invalid cell semantics, schema validation, composable table transforms, deterministic CSV interchange, and content digests for the Store/Lineage boundary.
+
+```bash
+python3 scripts/run_tests.py
+```
+
+Declared capabilities (declarations do not establish execution health):
+
+- `typed-data/0.1` — mncs-library (experimental)
+
+Semantic sources and ownership: `.mncs/projections.json`.
 <!-- MNCS:generated:end -->
 
 The smallest coherent typed data layer MNCS actually needs: explicit
